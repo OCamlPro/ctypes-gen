@@ -1,0 +1,735 @@
+(**************************************************************************)
+(*                                                                        *)
+(*  Copyright (c) 2024 OCamlPro SAS                                       *)
+(*                                                                        *)
+(*  All rights reserved.                                                  *)
+(*  This file is distributed under the terms of the GNU Lesser General    *)
+(*  Public License version 2.1, with the special exception on linking     *)
+(*  described in the LICENSE.md file in the root directory.               *)
+(*                                                                        *)
+(*                                                                        *)
+(**************************************************************************)
+
+open Types
+
+type printer =
+  | Generic
+  | GnuCOBOL
+
+(* We should "canonize" the types:
+   * all types not defined by the user should be seen as abstract
+     easy: there is an id that makes the difference between them
+   * all typedefs defined by the user should be eliminated
+*)
+
+let generic_printer = {|
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <strings.h>
+
+static void print_int_array (int indent, int n, int * tab);
+
+#define PRINT_NULL(indent,ty) printf ("NULL")
+#define PRINT_ENUM_TY(s)                                  \
+ /*   const char* ty = s */
+#define PRINT_ENUM(indent,ty,s)                           \
+     printf ("%s", s)
+#define PRINT_ENUM_UNKNOWN(indent,ty,s)                   \
+     printf ("Unknown enum %d", s)
+
+#define PRINT_STRUCT_KNOWN(indent, ty, ptr_uid) \
+   printf ("ALREADY_SEEN(%s --> MB%d)", ty, ptr_uid)
+#define PRINT_STRUCT_TY(s)                                \
+    const char* ty = s
+#define PRINT_STRUCT_PTR_TY(s)                            \
+    const char* ty = s
+#define PRINT_STRUCT_BEGIN(indent,ty, ptr_uid)            \
+    printf ("MEMORY_BLOCK(MB%d):\n", ptr_uid);              \
+    printf ("%s{ //[%s]\n", get_indent (indent), ty)
+#define PRINT_STRUCT_END(indent,ty)                       \
+    printf ("%s} //[%s]", get_indent (indent), ty)
+#define PRINT_VOID(indent)                                \
+    printf("<void>")
+#define PRINT_FUNCTION(indent)                            \
+    printf("<function>")
+#define PRINT_STRUCT_FIELD_BEGIN(indent,name)             \
+    printf ("%s " #name ": ", get_indent (indent) )
+#define PRINT_STRUCT_FIELD_END(indent)                    \
+    printf (";\n")
+#define PRINT_STRUCT_FIELD_END(indent)                    \
+    printf (";\n")
+#define PRINT_ARRAY_BEGIN(indent)                         \
+    printf ("[\n")
+#define PRINT_ARRAY_SEP(indent)                           \
+    printf (",\n")
+#define PRINT_ARRAY_END(indent)                           \
+    printf ("]")
+
+
+
+#define PRINT_UNKNOWN_SELECTOR(indent,ty, tag)            \
+        printf ("%s UNKNOWN %s(%d)\n", get_indent(indent), ty, tag);
+
+
+static void print_size_t (int indent, size_t x)
+{
+   printf ("%ld", x);
+}
+
+static void print_int (int indent, int x)
+{
+   printf ("%d", x);
+}
+
+static void print_char (int indent, char x)
+{
+   printf ("'%c'(%d)", x, x);
+}
+
+static void print_uchar (int indent, unsigned char x)
+{
+   printf ("%d", x);
+}
+
+static void print_uint (int indent, unsigned int x)
+{
+   printf ("%d", x);
+}
+
+static void print_char_ptr (int indent, const char* x)
+{
+   if (x == NULL){
+     PRINT_NULL(indent,ty);
+   } else {
+     printf ("\"%s\"", x);
+   }
+}
+
+static void print_uchar_ptr (int indent, const unsigned char* x)
+{
+   if (x == NULL){
+     PRINT_NULL(indent,ty);
+   } else {
+     printf ("%s", x);
+   }
+}
+
+static void print_FILE_ptr (int indent, const FILE* x)
+{
+   if (x == NULL){
+     PRINT_NULL(indent,ty);
+   } else {
+     printf ("<SOME FILE*>");
+   }
+}
+
+static void print_int_ptr (int indent, const int* x)
+{
+   if (x == NULL){
+     PRINT_NULL(indent,ty);
+   } else {
+     printf ("<SOME INT*>");
+   }
+}
+
+static void print_int_array (int indent, int n, int *x)
+{
+   if (x == NULL){
+     PRINT_NULL(indent,ty);
+   } else {
+     printf ("<SOME INT[]>");
+   }
+}
+
+|}
+
+let table_of_types type_decls =
+
+  let table = Hashtbl.create 1000 in
+
+  let add kind name sd =
+    let key = (kind, name) in
+    if ( Hashtbl.mem table key ) then
+      Printf.eprintf "Warning: redefinition of %s %S\n%!"
+        (string_of_kind kind)  name
+    else
+      Hashtbl.add table key sd ;
+    (*    Printf.printf "%s %S\n%!" ( string_of_kind kind ) name ;*)
+  in
+
+  List.iter (fun td ->
+      let name, kind =
+        match td with
+        | Struct_def (name, _sd) -> name, KStruct
+        | Union_def (name, _sd) -> name, KUnion
+        | Enum_def (name, _sd) -> name, KEnum
+        | Type_def (name, _, _sd) -> name, KTypedef
+      in
+      add kind name td
+    ) type_decls ;
+
+  table
+
+let gen_printer ?include_printer table type_decls =
+
+  let b = Buffer.create 10000 in
+  let used = Hashtbl.create 1000 in
+
+  Printf.bprintf b
+    {|/* Generated by ctypes-gen */
+|};
+
+  begin
+    match include_printer with
+    | None
+    | Some GnuCOBOL -> ()
+    | Some Generic ->
+        Printf.bprintf b "%s\n" generic_printer
+  end;
+  Printf.bprintf b {|
+
+static const char * get_indent (int indent){
+   static int   current_indent = 0;
+   static char* indent_string = NULL;
+   static int   current_size ;
+   if (indent == 0 || !print_tree_with_indent) return "";
+
+   if (indent >= current_size){
+     int i;
+     if (indent_string != NULL) free (indent_string);
+     current_size = indent + 100 ;
+     indent_string = (char*) malloc ( current_size );
+     current_indent = current_size-1;
+     for (i=0; i<current_indent ; i++) indent_string[i] = ' ';
+     indent_string [current_size-1] = 0;
+   }
+   if (indent != current_indent){
+     indent_string [current_indent] = ' ';
+     indent_string [indent] = 0;
+     current_indent = indent;
+   }
+   return indent_string;
+}
+
+static void **ptr_table = NULL ;
+static int   *num_table = NULL ;
+static int    ptr_table_size = 0 ;  /* MUST BE A POWER OF 2 */
+static int    ptr_table_used = 0 ;
+
+static void init_ptr_table ()
+{
+  if (ptr_table == NULL){
+    ptr_table_size = 512 ;
+    ptr_table = (void**) calloc (ptr_table_size, sizeof (void*) );
+    num_table = (int*)   calloc (ptr_table_size, sizeof (int) );
+  } else {
+    bzero (ptr_table, ptr_table_size * sizeof(void*) );
+    bzero (num_table, ptr_table_size * sizeof(int) );
+    ptr_table_used = 0;
+  }
+}
+
+static void clear_ptr_table ()
+{
+  if (ptr_table != NULL){
+    free (ptr_table);
+    free (num_table);
+    ptr_table_size = 0 ;
+    ptr_table_used = 0 ;
+  }
+}
+
+#define HASH_PTR(ptr)   ( ( (uint64_t)(ptr) ) ^ (( (uint64_t)(ptr) ) >> 16 ))
+#define MODULO2(v, size) ( (v) & ((size)-1) )
+
+/* returns uid, < 0 if ptr is already known, >0 if ptr was added */
+static int is_known_ptr (void *ptr)
+{
+  int pos ;
+  pos = MODULO2( HASH_PTR(ptr), ptr_table_size) ;
+  while ( ptr_table[pos] != NULL ){
+    if ( ptr_table[pos] == ptr ) return -num_table[pos] ;
+    pos = MODULO2( pos+1, ptr_table_size ) ;
+  }
+
+  /* ptr not found. Remember it */
+  ptr_table[pos] = ptr;
+  ptr_table_used++;
+  num_table[pos] = ptr_table_used;
+
+  if (ptr_table_used*2 > ptr_table_size) {
+    void **new_ptr_table ;
+    int   *new_num_table ;
+
+    /* realloc table to keep vaccum property */
+    pos = ptr_table_size ;
+    ptr_table_size *= 4;
+    new_ptr_table = (void**) calloc (ptr_table_size, sizeof(void*)) ;
+    new_num_table = (int*)   calloc (ptr_table_size, sizeof(int)) ;
+    while (pos>0){
+      int new_pos ;
+      pos--;
+      ptr = ptr_table[pos];
+      new_pos = MODULO2( HASH_PTR( ptr ) , ptr_table_size ) ;
+      while ( new_ptr_table[new_pos] != NULL ){
+        new_pos = MODULO2( new_pos+1, ptr_table_size );
+      }
+      new_ptr_table[new_pos] = ptr ;
+      new_num_table[new_pos] = num_table[pos] ;
+    }
+    free (ptr_table);
+    ptr_table = new_ptr_table;
+    free (num_table);
+    num_table = new_num_table;
+  }
+
+  return ptr_table_used;
+}
+
+|};
+
+  let rec iter kind name =
+    let key = (kind, name) in
+    match Hashtbl.find used key with
+    | _ -> ()
+    | exception Not_found ->
+        match Hashtbl.find table key with
+        | exception Not_found -> ()
+        | td ->
+            Hashtbl.add used key ();
+
+
+            begin
+              match td with
+
+
+              | Struct_def _ ->
+                  Printf.bprintf b {|
+static void print_struct_%s (int indent, int ptr_uid, struct %s *ptr);
+static void print_struct_%s_ptr (int indent, struct %s *ptr){
+    int ptr_uid ;
+    PRINT_STRUCT_PTR_TY("struct %s*");
+    if (ptr == NULL){
+       PRINT_NULL(indent,ty);
+       return;
+    }
+    ptr_uid = is_known_ptr (ptr);
+    if (ptr_uid < 0 ){
+       ptr_uid = -ptr_uid;
+       PRINT_STRUCT_KNOWN(indent, ty, ptr_uid);
+       return;
+    }
+    print_struct_%s (indent, ptr_uid, ptr);
+}
+|} name name name name name name
+
+
+              | Enum_def (_,e) ->
+                  Printf.bprintf b {|
+static void print_enum_%s (int indent, enum %s x){
+   PRINT_ENUM_TY("enum %s");
+   const char *s = NULL;
+   switch (x){
+|} name name name;
+
+                  List.iter (fun (enum, _) ->
+                      Printf.bprintf b {|
+      case %s: s = "%s"; break;
+|} enum enum;
+                    ) e.enum_fields;
+                  Printf.bprintf b {|
+   }
+   if ( s == NULL ){
+     PRINT_ENUM_UNKNOWN(indent, ty, x);
+   } else {
+     PRINT_ENUM(indent,ty,s);
+   }
+}
+|} ;
+
+
+              | Union_def _ -> assert false
+              | Type_def _ -> assert false
+(*
+                  Printf.bprintf b {|
+static void print_%s (int indent, %s x);
+|} name name;
+*)
+            end;
+
+
+            begin
+              match td with
+              | Struct_def (_, sd) ->
+                  List.iter iter_field sd.struct_fields ;
+
+                  Printf.bprintf b {|
+static void print_struct_%s (int indent, int ptr_uid, struct %s *ptr){
+    PRINT_STRUCT_TY("struct %s");
+    PRINT_STRUCT_BEGIN(indent, ty, ptr_uid);
+    indent += 2;
+|} name name name;
+
+                  List.iter (fun f ->
+                      let name = match f.name with
+                        | None ->
+                            Printf.eprintf "Error at %s:%d\n No name\n%!"
+                              f.loc.file f.loc.line;
+                            assert false
+                        | Some name -> name
+                      in
+
+                      if maybe_null f then begin
+                        Printf.bprintf b {|
+    if( print_zero_fields || ptr->%s != NULL ){
+|} name;
+                        print_field f name;
+                        Printf.bprintf b {|
+    }
+|}
+                      end
+                      else
+                      if maybe_zero f then begin
+                        Printf.bprintf b {|
+    if( print_zero_fields || ptr->%s != 0 ){
+|} name;
+                        print_field f name;
+                        Printf.bprintf b {|
+    }
+|}
+                      end
+                      else
+                        print_field f name
+
+                    ) sd.struct_fields ;
+
+                  Printf.bprintf b {|
+    indent -= 2;
+    PRINT_STRUCT_END(indent, ty);
+}
+|}
+
+              | Union_def (_, _sd) -> assert false
+              (*              List.iter iter_field sd.union_fields *)
+              | Enum_def (_, _sd) -> ()
+              | Type_def (_, _, sd) ->
+                  iter_field sd
+            end;
+
+  and iter_field field =
+    (* BEWARE: this is not enough !!! *)
+    match field.typename with
+    | Type_name name -> iter KTypedef name
+    | Function -> ()
+    | Integer _attrs -> ()
+    | Enum_name name -> iter KEnum name
+    | Struct (Some name, _) -> iter KStruct name
+    | Union (Some name, _) -> iter KUnion name
+    | Struct (None, Some d) -> List.iter iter_field d.struct_fields
+    | Union (None, Some d) -> List.iter iter_field d.union_fields
+    | Struct _ -> assert false
+    | Union _ -> assert false
+
+  and print_field f name =
+
+    Printf.bprintf b {|
+    PRINT_STRUCT_FIELD_BEGIN(indent,%s);
+|} name;
+    print_value f name;
+    Printf.bprintf b {|
+    PRINT_STRUCT_FIELD_END(indent);
+|};
+    ()
+
+  and maybe_null f = match f with
+    | { stars ; _ } when stars > 0 -> true
+    | _ -> false
+
+  and maybe_zero f = match f with
+    | { typename = Integer _ ;
+        occur = One | Bits _ ;
+        stars = 0 ; _ } ->
+        true
+    | _ -> false
+
+  and print_value f name =
+    match f with
+
+    | { typename = Integer [Int] ;
+        occur = Array [NUM n] ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_int_array (indent+2, %s, ptr->%s);
+|} n name
+
+    | { typename = Integer [Char] ;
+        occur = Array _ ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_char_array (indent+2, sizeof(ptr->%s), ptr->%s);
+|} name name
+
+    | { typename = Integer [Char] ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_char (indent+2, ptr->%s);
+|} name
+
+    | { typename = Integer [Int|Short] ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_int (indent+2, ptr->%s);
+|} name
+
+    | { typename = Integer [ (Int|Short) ; Unsigned ] ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_uint (indent+2, ptr->%s);
+|} name
+
+    | { typename = Integer [Int] ;
+        occur = One ;
+        stars = 1 ; _ } ->
+        Printf.bprintf b {|
+    print_int_ptr (indent+2, ptr->%s);
+|} name
+
+    | { typename = Integer [Char] ;
+        occur = One ;
+        stars = 1 ; _ } ->
+        Printf.bprintf b {|
+    print_char_ptr (indent+2, ptr->%s);
+|} name
+
+    | { typename = Integer [Char;Unsigned] ;
+        occur = One ;
+        stars = 1 ; _ } ->
+        Printf.bprintf b {|
+    print_uchar_ptr (indent+2, ptr->%s);
+|} name
+
+    | { typename = Integer [Char;Unsigned] ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_uchar (indent+2, ptr->%s);
+|} name
+
+    | { typename = Integer _ ;
+        occur = Bits _ ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_int (indent, ptr->%s);
+|} name
+
+    | { occur = Array [NUM n] ;
+        _ } ->
+        Printf.bprintf b {|
+   PRINT_ARRAY_BEGIN(indent);
+   {
+      int i;
+      for (i=0; i<%s; i++){
+        if (i>0){
+           PRINT_ARRAY_SEP(indent);
+        }
+|} n;
+        let name = Printf.sprintf "%s[i]" name in
+        print_value { f with occur = One } name ;
+        Printf.bprintf b {|
+      }
+   }
+   PRINT_ARRAY_END(indent);
+|};
+
+    | { typename = Type_name "void" ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    PRINT_VOID(indent);
+|}
+
+    | { occur = ( Array _ | Bits _ ) ; _ } ->
+
+        Printf.eprintf "Error at %s:%d\n Unexpected occur %s\n%!"
+          f.loc.file f.loc.line
+          (string_of_occur f.occur);
+        exit 2
+
+    | { typename = Function ; _ } ->
+        Printf.bprintf b {|
+    PRINT_FUNCTION(indent);
+|} ;
+
+        (* 2 Generic struct cases *)
+    | { typename = Struct (Some ty_name, None) ;
+        occur = One ;
+        stars = 1 ; _ } ->
+        Printf.bprintf b {|
+    if (ptr->%s == NULL){
+       PRINT_NULL(indent,ty);
+    } else {
+       print_struct_%s_ptr (indent+2, ptr->%s);
+    }
+|} name ty_name name
+
+    | { typename = Struct (Some ty_name, None) ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_struct_%s (indent+2, 0, &ptr->%s);
+|} ty_name name
+
+    | { typename = Enum_name ty_name ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_enum_%s (indent+2, ptr->%s);
+|} ty_name name
+
+
+    (* 2 Generic cases *)
+    | { typename = Type_name ty_name ;
+        occur = One ;
+        stars = 1 ; _ } ->
+        Printf.bprintf b {|
+    if (ptr->%s == NULL){
+       PRINT_NULL(indent,ty);
+    } else {
+       print_%s_ptr (indent+2, ptr->%s);
+    }
+|} name ty_name name
+
+    | { typename = Type_name ty_name ;
+        occur = One ;
+        stars = 0 ; _ } ->
+        Printf.bprintf b {|
+    print_%s (indent+2, ptr->%s);
+|} ty_name name
+
+    | { typename = Struct (Some ty_name, _) ; stars ; _ } ->
+
+        Printf.bprintf b {|
+    print_%s_ptr%d (indent+2, ptr->%s);
+|}
+          ty_name
+          stars
+          name
+
+    | { typename = Enum_name _ ; stars ; _ } ->
+        Printf.bprintf b {|
+          // TODO: enum %S %s
+|} name (match stars with
+         | 0 -> ""
+         | 1 -> "*"
+         | _ -> assert false)
+
+
+    | { typename = Integer attrs ; stars ; _ } ->
+        Printf.bprintf b {|
+          // TODO: %s %s
+|} ( String.concat "&"
+       ( List.map string_of_attr attrs))
+          (match stars with
+           | 0 -> ""
+           | 1 -> "*"
+           | _ -> assert false)
+
+    | { typename = Type_name _ ; _ } -> assert false
+    | { typename = Struct _ ; _ } -> assert false
+    | { typename = Union _ ; _ } -> assert false
+
+  in
+  begin
+    match include_printer with
+    | None -> ()
+    | Some Generic -> ()
+    | Some GnuCOBOL ->
+
+        let cases =
+          match Hashtbl.find table (KEnum, "cb_tag") with
+          | exception Not_found -> assert false
+          | Enum_def (_, { enum_fields ; _ }) ->
+              List.map (fun (enum, _) ->
+                  let len = String.length enum in
+                  let name = String.lowercase_ascii (String.sub enum 7 (len-7)) in
+                  let name = "cb_" ^ name in
+                  let name = match name with
+                    | "cb_decimal_literal" -> "cb_decimal"
+                    | "cb_report_line" -> "cb_reference"
+                    | "cb_ml_suppress" -> "cb_ml_suppress_clause"
+                    | "cb_ml_tree" -> "cb_ml_generate_tree"
+                    | "cb_tab_vals" -> "cb_table_values"
+                    | _ -> name
+                  in
+                  enum, name
+                ) enum_fields
+          | _ -> assert false
+        in
+
+
+        Hashtbl.add used (KTypedef, "cb_tree") ();
+        Hashtbl.add used (KTypedef, "void") ();
+        Hashtbl.add used (KTypedef, "FILE") ();
+        Hashtbl.add used (KStruct, "cb_tree_common") ();
+        iter KEnum "cb_tag";
+        iter KEnum "cb_category";
+        List.iter (fun (_enum, name) ->
+            iter KStruct name
+          ) cases ;
+
+        Printf.bprintf b
+          {|
+
+static void print_struct_cb_tree_common_ptr (int indent, cb_tree cb){
+
+    const char* ty = "cb_tree";
+    if (cb == NULL){
+       PRINT_NULL(indent,ty);
+       return;
+    }
+    switch (cb->tag){
+|};
+
+        List.iter (fun (enum, name) ->
+            Printf.bprintf b  {|
+      case %s: { print_struct_%s_ptr (indent, (struct %s *)cb); return; }
+|} enum name name
+          ) cases ;
+
+        Printf.bprintf b
+          {|
+      default:
+        PRINT_UNKNOWN_SELECTOR(indent, ty, cb->tag);
+    }
+}
+
+static void cb_print_tree (cb_tree cb){
+   init_ptr_table ();
+   print_struct_cb_tree_common_ptr (0, cb);
+   clear_ptr_table ();
+}
+
+|};
+
+  end;
+
+  let print_unused = false in
+  if print_unused then
+    List.iter (fun td ->
+        let key =
+          match td with
+          | Struct_def (name, _sd) -> KStruct, name
+          | Union_def (name, _sd) -> KUnion, name
+          | Enum_def (name, _sd) -> KEnum, name
+          | Type_def (name, _, _sd) -> KTypedef, name
+        in
+        if not ( Hashtbl.mem used key ) then
+          let (kind, name) = key in
+          Printf.eprintf "%s %S unused\n%!" ( string_of_kind kind ) name
+      ) type_decls ;
+
+  Buffer.contents b

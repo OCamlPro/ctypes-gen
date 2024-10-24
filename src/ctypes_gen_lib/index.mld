@@ -1,0 +1,9 @@
+{1 Library ctypes_gen_lib}
+
+This is the description
+of the ctypes_gen OCaml project
+
+
+
+The entry point of this library is the module: {!Ctypes_gen_lib}.
+
