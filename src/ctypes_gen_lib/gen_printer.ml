@@ -328,10 +328,9 @@ static void print_struct_%s_ptr (int indent, struct %s *ptr){
               | Enum_def (_,e) ->
                   Printf.bprintf b {|
 static void print_enum_%s (int indent, enum %s x){
-   PRINT_ENUM_TY("enum %s");
    const char *s = NULL;
    switch (x){
-|} name name name;
+|} name name;
 
                   List.iter (fun (enum, _) ->
                       Printf.bprintf b {|
@@ -621,7 +620,7 @@ static void print_struct_%s (int indent, int ptr_uid, struct %s *ptr){
 
     | { typename = Enum_name _ ; stars ; _ } ->
         Printf.bprintf b {|
-          // TODO: enum %S %s
+          /* TODO: enum %S %s */
 |} name (match stars with
          | 0 -> ""
          | 1 -> "*"
@@ -630,13 +629,12 @@ static void print_struct_%s (int indent, int ptr_uid, struct %s *ptr){
 
     | { typename = Integer attrs ; stars ; _ } ->
         Printf.bprintf b {|
-          // TODO: %s %s
-|} ( String.concat "&"
-       ( List.map string_of_attr attrs))
-          (match stars with
-           | 0 -> ""
-           | 1 -> "*"
-           | _ -> assert false)
+    print_%s_ptr%d (indent+2, ptr->%s);
+|}
+          ( String.concat "_"
+              ( List.map string_of_attr attrs))
+          stars
+          name
 
     | { typename = Type_name _ ; _ } -> assert false
     | { typename = Struct _ ; _ } -> assert false
